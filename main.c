@@ -13,6 +13,7 @@
 #include "int21.h"
 
 #define DOS_ADDR 0x100
+#define SEGMENT_SIZE 64 * 1024
 
 
 #pragma pack(push, 1)
@@ -45,7 +46,7 @@ struct PSP {
 #pragma pack(pop)
 
 
-static void usage(char *prog)
+static void usage(const char *prog)
 {
     printf("UniDOS for DOS emulation. Based on Unicorn engine (www.unicorn-engine.org)\n");
     printf("Syntax: %s <COM>\n", prog);
@@ -89,6 +90,41 @@ static void setup_psp(int16_t seg, uint8_t *fcontent, int argc, char **argv)
     */
 }
 
+static size_t load_com(uc_engine *uc, uint8_t *fcontent, const char *fname)
+{
+    FILE *f = fopen(fname, "rb");
+    if (f == NULL) {
+        perror("Error");
+        uc_close(uc);
+        exit(EXIT_FAILURE);
+    }
+
+    // find the file size
+    fseek(f, 0, SEEK_END);      // seek to end of file
+    size_t fsize = ftell(f);    // get current file pointer
+    fseek(f, 0, SEEK_SET);      // seek back to beginning of file
+
+    // check .com size 
+    if (fsize == 0 || fsize > 0xff00) {
+        fprintf(stderr, "Invalid file size\n");
+        fclose(f);
+        uc_close(uc);
+        exit(EXIT_FAILURE);
+    }
+
+    // copy data in from 0x100
+    memset(fcontent, 0, SEGMENT_SIZE);
+    fread(fcontent + DOS_ADDR, fsize, 1, f);
+
+    // initialize stack pointer
+    uint16_t r_sp = 0xffff;
+    uc_reg_write(uc, UC_X86_REG_SP, &r_sp);
+
+    fclose(f);
+
+    return fsize;
+}
+
 // callback for handling interrupt
 void hook_intr(uc_engine *uc, uint32_t intno, void *user_data)
 {
@@ -117,41 +153,25 @@ int main(int argc, char **argv)
     uc_engine *uc;
     uc_hook trace;
     uc_err err;
-    char *fname;
-    FILE *f;
-    uint8_t fcontent[64 * 1024];    // 64KB for .COM file
-    long fsize;
+
+    uint8_t fcontent[SEGMENT_SIZE];    // 64KB for .COM file
 
     if (argc == 1) {
         usage(argv[0]);
         return -1;
     }
 
-    fname = argv[1];
-    f = fopen(fname, "r");
-    if (f == NULL) {
-        printf("ERROR: failed to open file '%s'\n", fname);
-        return -2;
-    }
-
-    // find the file size
-    fseek(f, 0, SEEK_END); // seek to end of file
-    fsize = ftell(f); // get current file pointer
-    fseek(f, 0, SEEK_SET); // seek back to beginning of file
-
-    // copy data in from 0x100
-    memset(fcontent, 0, sizeof(fcontent));
-    fread(fcontent + DOS_ADDR, fsize, 1, f);
+    const char *fname = argv[1];
 
     err = uc_open (UC_ARCH_X86, UC_MODE_16, &uc);
     if (err) {
-        fprintf (stderr, "Cannot initialize unicorn\n");
+        fprintf(stderr, "Cannot initialize unicorn\n");
         return 1;
     }
 
     // map 64KB in
-    if (uc_mem_map (uc, 0, 64 * 1024, UC_PROT_ALL)) {
-        printf("Failed to write emulation code to memory, quit!\n");
+    if (uc_mem_map (uc, 0, SEGMENT_SIZE, UC_PROT_ALL)) {
+        fprintf(stderr, "Failed to write emulation code to memory, quit!\n");
         uc_close(uc);
         return 0;
     }
@@ -159,18 +179,21 @@ int main(int argc, char **argv)
     // initialize internal settings
     int21_init();
 
+    //load executable
+    size_t fsize = load_com(uc, fcontent, fname);
+
     // setup PSP
     setup_psp(0, fcontent, argc, argv);
 
     // write machine code to be emulated in, including the prefix PSP
-    uc_mem_write (uc, 0, fcontent, DOS_ADDR + fsize);
+    uc_mem_write(uc, 0, fcontent, DOS_ADDR + fsize);
 
     // handle interrupt ourself
     uc_hook_add(uc, &trace, UC_HOOK_INTR, hook_intr, NULL);
 
-    err = uc_emu_start(uc, DOS_ADDR, DOS_ADDR + 0x10000, 0, 0);
+    err = uc_emu_start(uc, DOS_ADDR, DOS_ADDR + 0xFF00, 0, 0);
     if (err) {
-        printf("Failed on uc_emu_start() with error returned %u: %s\n",
+        fprintf(stderr, "Failed on uc_emu_start() with error returned %u: %s\n",
                 err, uc_strerror(err));
     }
 
