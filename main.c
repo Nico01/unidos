@@ -13,7 +13,7 @@
 #include "int21.h"
 
 #define DOS_ADDR 0x100
-#define SEGMENT_SIZE 64 * 1024
+#define MEM_SIZE 1 << 20 // 1 MB
 
 
 #pragma pack(push, 1)
@@ -52,12 +52,12 @@ static void usage(const char *prog)
     printf("Syntax: %s <COM>\n", prog);
 }
 
-static void setup_psp(int16_t seg, uint8_t *fcontent, int argc, char **argv)
+static void setup_psp(int16_t seg, uint8_t *memory, int argc, char **argv)
 {
     uint32_t abs = MK_FP(seg, 0);
     int j;
     uint8_t c = 0;
-    struct PSP *PSP = (struct PSP *)(fcontent + abs);
+    struct PSP *PSP = (struct PSP *)(memory + abs);
 
     // CPMExit: INT 20h
     PSP->CPMExit[0] = 0xcd;
@@ -90,7 +90,7 @@ static void setup_psp(int16_t seg, uint8_t *fcontent, int argc, char **argv)
     */
 }
 
-static size_t load_com(uc_engine *uc, uint8_t *fcontent, const char *fname)
+static size_t load_com(uc_engine *uc, uint8_t *memory, const char *fname)
 {
     FILE *f = fopen(fname, "rb");
     if (f == NULL) {
@@ -113,12 +113,23 @@ static size_t load_com(uc_engine *uc, uint8_t *fcontent, const char *fname)
     }
 
     // copy data in from 0x100
-    memset(fcontent, 0, SEGMENT_SIZE);
-    fread(fcontent + DOS_ADDR, fsize, 1, f);
+    memset(memory, 0, MEM_SIZE);
+    fread(memory + DOS_ADDR, fsize, 1, f);
 
     // initialize stack pointer
-    uint16_t r_sp = 0xffff;
+    uint16_t r_sp = 0xfffe;
     uc_reg_write(uc, UC_X86_REG_SP, &r_sp);
+
+    // initialize segment registers
+    uint16_t r_cs = 0,
+             r_ds = 0,
+             r_es = 0,
+             r_ss = 0;
+
+    uc_reg_write(uc, UC_X86_REG_CS, &r_cs);
+    uc_reg_write(uc, UC_X86_REG_DS, &r_ds);
+    uc_reg_write(uc, UC_X86_REG_ES, &r_es);
+    uc_reg_write(uc, UC_X86_REG_SS, &r_ss);
 
     fclose(f);
 
@@ -154,7 +165,7 @@ int main(int argc, char **argv)
     uc_hook trace;
     uc_err err;
 
-    uint8_t fcontent[SEGMENT_SIZE];    // 64KB for .COM file
+    uint8_t memory[MEM_SIZE];
 
     if (argc == 1) {
         usage(argv[0]);
@@ -170,7 +181,7 @@ int main(int argc, char **argv)
     }
 
     // map 64KB in
-    if (uc_mem_map (uc, 0, SEGMENT_SIZE, UC_PROT_ALL)) {
+    if (uc_mem_map (uc, 0, MEM_SIZE, UC_PROT_ALL)) {
         fprintf(stderr, "Failed to write emulation code to memory, quit!\n");
         uc_close(uc);
         return 0;
@@ -180,18 +191,18 @@ int main(int argc, char **argv)
     int21_init();
 
     //load executable
-    size_t fsize = load_com(uc, fcontent, fname);
+    size_t fsize = load_com(uc, memory, fname);
 
     // setup PSP
-    setup_psp(0, fcontent, argc, argv);
+    setup_psp(0, memory, argc, argv);
 
     // write machine code to be emulated in, including the prefix PSP
-    uc_mem_write(uc, 0, fcontent, DOS_ADDR + fsize);
+    uc_mem_write(uc, 0, memory, DOS_ADDR + fsize);
 
     // handle interrupt ourself
     uc_hook_add(uc, &trace, UC_HOOK_INTR, hook_intr, NULL);
 
-    err = uc_emu_start(uc, DOS_ADDR, DOS_ADDR + 0xFF00, 0, 0);
+    err = uc_emu_start(uc, DOS_ADDR, DOS_ADDR + 0x10000, 0, 0);
     if (err) {
         fprintf(stderr, "Failed on uc_emu_start() with error returned %u: %s\n",
                 err, uc_strerror(err));
